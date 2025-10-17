@@ -4,11 +4,10 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from typing import List, Optional
+from typing import Optional
 import os
 import asyncio
 
-# Import scraper
 from app.scrapers import scrape_live_sports
 
 # Load environment variables
@@ -16,46 +15,48 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI", "")
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI not set in environment")
-print("MONGO_URI =", MONGO_URI)
 
-# Initialize MongoDB client
+# Initialize MongoDB
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["live_dashboard"]
 
-# Initialize FastAPI app
-app = FastAPI(title="Live Sports API")
+# FastAPI app
+app = FastAPI(title="Live Sports API", version="1.0.0")
 
-# Enable CORS
+# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=["*"],  # change in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models
+# ---------------- Models ----------------
 class SportsMatch(BaseModel):
     match_id: str = Field(..., example="match_12345")
     team_a: str = Field(..., example="Team A")
     team_b: str = Field(..., example="Team B")
+    logo_a: Optional[str] = Field(None, example="https://logo.com/team_a.png")
+    logo_b: Optional[str] = Field(None, example="https://logo.com/team_b.png")
     score_a: Optional[int] = Field(None, example=0)
     score_b: Optional[int] = Field(None, example=0)
     status: str = Field(..., example="live")  # live, upcoming, finished
     last_updated: Optional[datetime] = Field(default_factory=datetime.utcnow)
 
-# Create indexes for faster queries
+# ---------------- MongoDB Index ----------------
 async def create_indexes():
     await db.sports_matches.create_index("status")
     await db.sports_matches.create_index("last_updated")
     await db.sports_matches.create_index("match_id", unique=True)
 
-# Background task to scrape and update MongoDB
+# ---------------- Background Updater ----------------
 async def update_mongodb_periodically(interval: int = 300):
+    """Scrape live sports and update MongoDB every `interval` seconds."""
     while True:
         try:
-            live_matches = await scrape_live_sports()
-            for match in live_matches:
+            matches = await scrape_live_sports()
+            for match in matches:
                 await db.sports_matches.update_one(
                     {"match_id": match["match_id"]},
                     {"$set": match},
@@ -67,18 +68,17 @@ async def update_mongodb_periodically(interval: int = 300):
 
         await asyncio.sleep(interval)
 
-# Startup event
+# ---------------- Startup ----------------
 @app.on_event("startup")
 async def startup_event():
     await create_indexes()
-    asyncio.create_task(update_mongodb_periodically(interval=300))  # every 5 minutes
+    asyncio.create_task(update_mongodb_periodically(interval=60))  # update every 1 minute
 
-# Health check
+# ---------------- Routes ----------------
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-# Sports endpoints
 @app.get("/sports/live")
 async def get_live_sports(limit: int = 50):
     cursor = db.sports_matches.find({"status": "live"}).sort("last_updated", -1).limit(limit)
@@ -90,7 +90,7 @@ async def get_live_sports(limit: int = 50):
 
 @app.get("/sports/upcoming")
 async def get_upcoming_sports(limit: int = 50):
-    cursor = db.sports_matches.find({"status": "upcoming"}).sort("last_updated", -1).limit(limit)
+    cursor = db.sports_matches.find({"status": {"$in": ["scheduled", "pre"]}}).sort("last_updated", -1).limit(limit)
     results = []
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
